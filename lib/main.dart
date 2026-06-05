@@ -267,6 +267,19 @@ class _MonitorScreenState extends State<MonitorScreen>
     return const [];
   }
 
+  // 확인(ack) 여부와 무관하게, 아직 해결되지 않은 모든 활성 알림.
+  // 송출상태 패널 순환 표시는 이걸 사용해, 확인 후에도 해결될 때까지 계속 돌려 보여준다.
+  List<Map<String, dynamic>> _allActiveAlerts(Map<String, dynamic>? status) {
+    if (status == null) return const [];
+    final list = status['activeAlerts'];
+    if (list is List) {
+      return list.whereType<Map<String, dynamic>>().toList();
+    }
+    final single = status['activeAlert'];
+    if (single is Map<String, dynamic>) return [single];
+    return const [];
+  }
+
   void _syncAlertFlash(List<Map<String, dynamic>> alerts) {
     if (alerts.isEmpty) {
       _lastAlertKey = null;
@@ -307,6 +320,7 @@ class _MonitorScreenState extends State<MonitorScreen>
   Widget build(BuildContext context) {
     final status = _status;
     final activeAlerts = _activeAlerts(status);
+    final allActiveAlerts = _allActiveAlerts(status);
     _syncAlertFlash(activeAlerts);
 
     return Scaffold(
@@ -336,7 +350,7 @@ class _MonitorScreenState extends State<MonitorScreen>
                       onModeToggle: _setOperateMode,
                     ),
                     const SizedBox(height: 10),
-                    _SummaryPanel(status: status),
+                    _SummaryPanel(status: status, alerts: allActiveAlerts),
                     const SizedBox(height: 10),
                     _StatusGrid(status: status),
                     const SizedBox(height: 10),
@@ -681,46 +695,135 @@ class _ModeOption extends StatelessWidget {
   }
 }
 
-class _SummaryPanel extends StatelessWidget {
-  const _SummaryPanel({required this.status});
+class _SummaryPanel extends StatefulWidget {
+  const _SummaryPanel({required this.status, this.alerts = const []});
 
   final Map<String, dynamic> status;
 
+  /// 해결되지 않은 오류(활성 알림) 목록. 2개 이상이면 자동으로 순환 표시.
+  final List<Map<String, dynamic>> alerts;
+
+  @override
+  State<_SummaryPanel> createState() => _SummaryPanelState();
+}
+
+class _SummaryPanelState extends State<_SummaryPanel> {
+  Timer? _timer;
+  int _index = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _restartTimer();
+  }
+
+  @override
+  void didUpdateWidget(covariant _SummaryPanel old) {
+    super.didUpdateWidget(old);
+    if (_index >= widget.alerts.length) _index = 0;
+    if (old.alerts.length != widget.alerts.length) _restartTimer();
+  }
+
+  void _restartTimer() {
+    _timer?.cancel();
+    // 알림이 2개 이상일 때만 3초마다 다음 메시지로 순환.
+    if (widget.alerts.length > 1) {
+      _timer = Timer.periodic(const Duration(seconds: 3), (_) {
+        if (!mounted) return;
+        setState(() => _index = (_index + 1) % widget.alerts.length);
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
-    final summary = status['summary'] as Map<String, dynamic>? ?? {};
-    final level = summary['level'] as String? ?? 'ok';
+    final alerts = widget.alerts;
+    final hasAlerts = alerts.isNotEmpty;
+
+    late final String level;
+    late final String title;
+    late final String message;
+    if (hasAlerts) {
+      final a = alerts[_index.clamp(0, alerts.length - 1)];
+      level = '${a['level'] ?? 'warn'}';
+      title = '${a['title'] ?? '경고'}';
+      message = '${a['message'] ?? ''}';
+    } else {
+      final summary = widget.status['summary'] as Map<String, dynamic>? ?? {};
+      level = summary['level'] as String? ?? 'ok';
+      title = '${summary['title'] ?? '정상 모니터링'}';
+      message = '${summary['message'] ?? '모든 지표가 안정적입니다'}';
+    }
     final color = levelColor(context, level);
+
+    // 1/2 · 2/2 카운터를 인디케이터(점) 옆에 배치.
+    Widget trailing = StatusDot(color: color);
+    if (hasAlerts && alerts.length > 1) {
+      trailing = Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '${_index + 1}/${alerts.length}',
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: color,
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
+          const SizedBox(width: 6),
+          StatusDot(color: color),
+        ],
+      );
+    }
+
     return Panel(
       title: '송출 상태',
-      trailing: StatusDot(color: color),
+      trailing: trailing,
       child: Row(
         children: [
           CircleAvatar(
             backgroundColor: color.withOpacity(0.12),
-            child: Icon(Icons.monitor_heart, color: color),
+            child: Icon(
+              hasAlerts ? Icons.warning_amber_rounded : Icons.monitor_heart,
+              color: color,
+            ),
           ),
           const SizedBox(width: 12),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  '${summary['title'] ?? '정상 모니터링'}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.w800,
-                      ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  '${summary['message'] ?? '-'}',
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ],
+            // 항상 2줄 높이를 차지해, 알림 메시지 유무/길이와 무관하게
+            // 패널 높이가 흔들리지 않게 한다. (제목 + 메시지 = 2줄,
+            //  메시지가 없으면 제목이 2줄까지 줄바꿈)
+            child: SizedBox(
+              height: 48,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    title,
+                    maxLines: message.isEmpty ? 2 : 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w800,
+                          height: 1.2,
+                        ),
+                  ),
+                  if (message.isNotEmpty) ...[
+                    const SizedBox(height: 3),
+                    Text(
+                      message,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ],
+              ),
             ),
           ),
         ],
@@ -762,12 +865,15 @@ class _StatusGrid extends StatelessWidget {
       TileData(
         'OBS',
         obsLive ? 'LIVE' : (streaming ? '대기' : (obsKnown ? '중지' : '연결 안됨')),
-        obsLive ? 'ok' : (obsKnown ? 'warn' : 'inactive'),
+        // 송출 중(streaming)인데 비트레이트가 안 잡히면 경고(주황),
+        // 꺼져있거나 연결 안 됨이면 비활성(회색).
+        obsLive ? 'ok' : (streaming ? 'warn' : 'inactive'),
       ),
       TileData(
         'YouTube',
         live ? 'LIVE' : (ytKnown ? '오프라인' : '연결 안됨'),
-        live ? 'ok' : (ytKnown ? 'warn' : 'inactive'),
+        // 라이브가 아니면(오프라인/연결 안 됨) 비활성(회색) — 꺼진 상태를 주황으로 표시하지 않음.
+        live ? 'ok' : 'inactive',
       ),
       TileData(
         '비트레이트',
@@ -1099,14 +1205,16 @@ class _AlertCard extends StatelessWidget {
       child: InkWell(
         onTap: onAck,
         borderRadius: BorderRadius.circular(12),
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 14, 12, 14),
+        child: Container(
+          constraints: const BoxConstraints(minHeight: 110),
+          alignment: Alignment.center,
+          padding: const EdgeInsets.fromLTRB(18, 24, 14, 24),
           child: Row(
             children: [
               Icon(
                 critical ? Icons.warning_amber_rounded : Icons.error_outline,
                 color: Colors.white,
-                size: 32,
+                size: 36,
               ),
               const SizedBox(width: 14),
               Expanded(

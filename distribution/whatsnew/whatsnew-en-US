@@ -1,9 +1,10 @@
 [First release] Stream Watcher Mobile
 
-• Auto-discovers your Stream Watcher server on the same Wi-Fi and connects instantly
+• Auto-discovers your PC streaming server on the same Wi-Fi and connects instantly
 • Simple, secure pairing with just a PIN
-• Real-time monitoring of stream status and alerts
-• Instant vibration when an alert fires
-• Scenario stage switching and alert acknowledgement
+• Real-time monitoring of OBS, YouTube, audio (LUFS), and bitrate
+• Instant vibration when an issue occurs, shown repeatedly until resolved
+• Cycle through unresolved alerts at a glance on the status panel
+• Scenario stage switching
 
-All communication stays within your local network — no data is sent externally.
+All communication stays within your local network.
