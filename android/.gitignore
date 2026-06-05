@@ -12,3 +12,8 @@ GeneratedPluginRegistrant.java
 key.properties
 **/*.keystore
 **/*.jks
+
+# Play App Signing / upload key artifacts (do not commit)
+**/output.zip
+**/upload_certificate.pem
+**/pepk.jar
