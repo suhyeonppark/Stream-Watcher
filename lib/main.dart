@@ -120,10 +120,10 @@ class _MonitorScreenState extends State<MonitorScreen>
     }
 
     await _run(() async {
-      setState(() => _message = 'Stream Mon 찾는 중...');
+      setState(() => _message = 'Stream Capture 찾는 중...');
       final server = await MobileDiscoveryClient().discover();
       if (server == null) {
-        throw Exception('Stream Mon을 찾지 못했습니다. PC와 같은 Wi-Fi인지 확인하세요.');
+        throw Exception('Stream Capture을 찾지 못했습니다. PC와 같은 Wi-Fi인지 확인하세요.');
       }
 
       _serverUrl = server.url;
@@ -584,7 +584,7 @@ class _DashboardHeader extends StatelessWidget {
       children: [
         Expanded(
           child: Text(
-            'Stream Mon',
+            'Stream Watcher',
             style: Theme.of(
               context,
             ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w800),

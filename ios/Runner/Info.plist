@@ -31,7 +31,7 @@
 		<string>_streamwatcher._tcp</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Stream Mon desktop app을 찾아 방송 상태를 표시합니다.</string>
+	<string>Stream Watcher desktop app을 찾아 방송 상태를 표시합니다.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
