@@ -12,14 +12,43 @@ const _defaultServerUrl = 'http://127.0.0.1:53683';
 const _prefServerUrl = 'serverUrl';
 const _prefToken = 'token';
 const _prefOperateMode = 'operateMode';
+const _prefThemeMode = 'themeMode';
 const _alertChannel = MethodChannel('stream_watcher_mobile/alerts');
 
 void main() {
   runApp(const StreamWatcherMobileApp());
 }
 
-class StreamWatcherMobileApp extends StatelessWidget {
+class StreamWatcherMobileApp extends StatefulWidget {
   const StreamWatcherMobileApp({super.key});
+
+  @override
+  State<StreamWatcherMobileApp> createState() => _StreamWatcherMobileAppState();
+}
+
+class _StreamWatcherMobileAppState extends State<StreamWatcherMobileApp> {
+  ThemeMode _themeMode = ThemeMode.system;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreThemeMode();
+  }
+
+  Future<void> _restoreThemeMode() async {
+    final prefs = await SharedPreferences.getInstance();
+    final value = prefs.getString(_prefThemeMode);
+    if (!mounted || value == null) return;
+    setState(() {
+      _themeMode = value == 'dark' ? ThemeMode.dark : ThemeMode.light;
+    });
+  }
+
+  Future<void> _setDarkMode(bool dark) async {
+    setState(() => _themeMode = dark ? ThemeMode.dark : ThemeMode.light);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_prefThemeMode, dark ? 'dark' : 'light');
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -28,13 +57,16 @@ class StreamWatcherMobileApp extends StatelessWidget {
       title: '방송 모니터링',
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
-      home: const MonitorScreen(),
+      themeMode: _themeMode,
+      home: MonitorScreen(onThemeToggle: _setDarkMode),
     );
   }
 }
 
 class MonitorScreen extends StatefulWidget {
-  const MonitorScreen({super.key});
+  const MonitorScreen({super.key, required this.onThemeToggle});
+
+  final ValueChanged<bool> onThemeToggle;
 
   @override
   State<MonitorScreen> createState() => _MonitorScreenState();
@@ -52,6 +84,7 @@ class _MonitorScreenState extends State<MonitorScreen>
   bool _busy = false;
   bool _operateMode = false;
   Map<String, dynamic>? _status;
+  final Set<String> _locallyAcknowledgedAlertKeys = <String>{};
   StreamSubscription<Map<String, dynamic>>? _eventsSub;
 
   StreamWatcherApi get _api =>
@@ -185,6 +218,7 @@ class _MonitorScreenState extends State<MonitorScreen>
 
   Future<void> _loadStatus() async {
     final status = await _api.status();
+    _syncLocalAckKeys(status);
     if (mounted) setState(() => _status = status);
   }
 
@@ -195,6 +229,7 @@ class _MonitorScreenState extends State<MonitorScreen>
         final type = event['event'];
         final data = event['data'];
         if (type == 'status' && data is Map<String, dynamic>) {
+          _syncLocalAckKeys(data);
           setState(() => _status = data);
         } else if (type == 'scenario') {
           _loadStatus().catchError((_) {});
@@ -244,10 +279,38 @@ class _MonitorScreenState extends State<MonitorScreen>
   Future<void> _ackAlert(String? alertId) async {
     // 탭 즉시 진동 중지 (다른 알림이 남아있으면 상태 갱신 후 다시 울림)
     _alertChannel.invokeMethod('stopAlertVibration').catchError((_) {});
+    final alerts = _activeAlerts(_status);
+    final acknowledged = alertId == null
+        ? alerts
+        : alerts.where((alert) => '${alert['id']}' == alertId).toList();
+    if (acknowledged.isNotEmpty) {
+      setState(() {
+        for (final alert in acknowledged) {
+          _locallyAcknowledgedAlertKeys.add(_alertKey(alert));
+        }
+      });
+    }
     await _run(() async {
       await _api.ack(alertId);
       await _loadStatus();
     });
+  }
+
+  String _alertKey(Map<String, dynamic> alert) {
+    final id = alert['id'];
+    if (id != null && '$id'.isNotEmpty) return 'id:$id';
+    return [
+      alert['type'],
+      alert['level'],
+      alert['title'],
+      alert['message'],
+    ].map((v) => '$v').join('|');
+  }
+
+  void _syncLocalAckKeys(Map<String, dynamic>? status) {
+    final activeKeys = _allActiveAlerts(status).map(_alertKey).toSet();
+    _locallyAcknowledgedAlertKeys
+        .removeWhere((key) => !activeKeys.contains(key));
   }
 
   List<Map<String, dynamic>> _activeAlerts(Map<String, dynamic>? status) {
@@ -257,11 +320,14 @@ class _MonitorScreenState extends State<MonitorScreen>
       return list
           .whereType<Map<String, dynamic>>()
           .where((a) => a['acknowledged'] != true)
+          .where((a) => !_locallyAcknowledgedAlertKeys.contains(_alertKey(a)))
           .toList();
     }
     // 구버전 PC 호환: 단일 activeAlert
     final single = status['activeAlert'];
-    if (single is Map<String, dynamic> && single['acknowledged'] != true) {
+    if (single is Map<String, dynamic> &&
+        single['acknowledged'] != true &&
+        !_locallyAcknowledgedAlertKeys.contains(_alertKey(single))) {
       return [single];
     }
     return const [];
@@ -321,6 +387,7 @@ class _MonitorScreenState extends State<MonitorScreen>
     final status = _status;
     final activeAlerts = _activeAlerts(status);
     final allActiveAlerts = _allActiveAlerts(status);
+    final isDarkMode = Theme.of(context).brightness == Brightness.dark;
     _syncAlertFlash(activeAlerts);
 
     return Scaffold(
@@ -337,6 +404,8 @@ class _MonitorScreenState extends State<MonitorScreen>
                 onPair: _pair,
                 operateMode: _operateMode,
                 onModeToggle: _setOperateMode,
+                isDarkMode: isDarkMode,
+                onThemeToggle: widget.onThemeToggle,
               )
             else
               ListView(
@@ -348,6 +417,8 @@ class _MonitorScreenState extends State<MonitorScreen>
                       onRefresh: () => _loadStatus().catchError((_) {}),
                       operateMode: _operateMode,
                       onModeToggle: _setOperateMode,
+                      isDarkMode: isDarkMode,
+                      onThemeToggle: widget.onThemeToggle,
                     ),
                     const SizedBox(height: 10),
                     _SummaryPanel(status: status, alerts: allActiveAlerts),
@@ -404,6 +475,8 @@ class _PairingPanel extends StatelessWidget {
     required this.onPair,
     required this.operateMode,
     required this.onModeToggle,
+    required this.isDarkMode,
+    required this.onThemeToggle,
   });
 
   final TextEditingController pinController;
@@ -412,6 +485,8 @@ class _PairingPanel extends StatelessWidget {
   final VoidCallback onPair;
   final bool operateMode;
   final ValueChanged<bool> onModeToggle;
+  final bool isDarkMode;
+  final ValueChanged<bool> onThemeToggle;
 
   @override
   Widget build(BuildContext context) {
@@ -431,6 +506,8 @@ class _PairingPanel extends StatelessWidget {
                     onRefresh: () {},
                     operateMode: operateMode,
                     onModeToggle: onModeToggle,
+                    isDarkMode: isDarkMode,
+                    onThemeToggle: onThemeToggle,
                   ),
                   const SizedBox(height: 10),
                   _SummaryPanel(status: _pairingPreviewStatus),
@@ -546,12 +623,16 @@ class _DashboardHeader extends StatelessWidget {
     required this.onRefresh,
     required this.operateMode,
     required this.onModeToggle,
+    required this.isDarkMode,
+    required this.onThemeToggle,
   });
 
   final bool busy;
   final VoidCallback onRefresh;
   final bool operateMode;
   final ValueChanged<bool> onModeToggle;
+  final bool isDarkMode;
+  final ValueChanged<bool> onThemeToggle;
 
   Future<void> _pickMode(BuildContext context) async {
     final selected = await showDialog<bool>(
@@ -594,6 +675,10 @@ class _DashboardHeader extends StatelessWidget {
         operateMode ? scheme.primaryContainer : scheme.surfaceContainerHighest;
     final fg =
         operateMode ? scheme.onPrimaryContainer : scheme.onSurfaceVariant;
+    final themeFill =
+        isDarkMode ? scheme.primaryContainer : scheme.surfaceContainerHighest;
+    final themeFg =
+        isDarkMode ? scheme.onPrimaryContainer : scheme.onSurfaceVariant;
     return Row(
       children: [
         Expanded(
@@ -621,6 +706,29 @@ class _DashboardHeader extends StatelessWidget {
                     operateMode ? '운영' : '노멀',
                     style: TextStyle(
                       color: fg,
+                      fontWeight: FontWeight.w700,
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            Material(
+              color: themeFill,
+              borderRadius: BorderRadius.circular(6),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(6),
+                onTap: () => onThemeToggle(!isDarkMode),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 4,
+                  ),
+                  child: Text(
+                    isDarkMode ? '다크' : '라이트',
+                    style: TextStyle(
+                      color: themeFg,
                       fontWeight: FontWeight.w700,
                       fontSize: 11,
                     ),
@@ -897,17 +1005,27 @@ class _StatusGrid extends StatelessWidget {
       ),
     ];
 
-    return GridView.builder(
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      itemCount: tiles.length,
-      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-        crossAxisCount: 2,
-        childAspectRatio: 2.15,
-        crossAxisSpacing: 10,
-        mainAxisSpacing: 10,
-      ),
-      itemBuilder: (context, index) => StatusTile(data: tiles[index]),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        final crossAxisCount = width >= 1200 ? 4 : (width >= 700 ? 3 : 2);
+        final childAspectRatio = width >= 700 ? 3.2 : 2.15;
+        return GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          itemCount: tiles.length,
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: crossAxisCount,
+            childAspectRatio: childAspectRatio,
+            crossAxisSpacing: 8,
+            mainAxisSpacing: 8,
+          ),
+          itemBuilder: (context, index) => StatusTile(
+            data: tiles[index],
+            compact: width >= 700,
+          ),
+        );
+      },
     );
   }
 }
@@ -1323,15 +1441,16 @@ class Panel extends StatelessWidget {
 }
 
 class StatusTile extends StatelessWidget {
-  const StatusTile({super.key, required this.data});
+  const StatusTile({super.key, required this.data, this.compact = false});
 
   final TileData data;
+  final bool compact;
 
   @override
   Widget build(BuildContext context) {
     final color = levelColor(context, data.level);
     return Container(
-      padding: const EdgeInsets.all(12),
+      padding: EdgeInsets.all(compact ? 10 : 12),
       decoration: BoxDecoration(
         color: Theme.of(
           context,
@@ -1339,31 +1458,63 @@ class StatusTile extends StatelessWidget {
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: Theme.of(context).dividerColor),
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Row(
-            children: [
-              Expanded(
-                child: Text(
-                  data.label,
-                  style: Theme.of(context).textTheme.labelMedium,
+      child: compact
+          ? Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        data.label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.labelSmall,
+                      ),
+                      const SizedBox(height: 3),
+                      Text(
+                        data.value,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        textScaler: const TextScaler.linear(1),
+                        style: Theme.of(context)
+                            .textTheme
+                            .titleSmall
+                            ?.copyWith(fontWeight: FontWeight.w800),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-              StatusDot(color: color),
-            ],
-          ),
-          Text(
-            data.value,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-            style: Theme.of(
-              context,
-            ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w700),
-          ),
-        ],
-      ),
+                const SizedBox(width: 8),
+                StatusDot(color: color),
+              ],
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        data.label,
+                        style: Theme.of(context).textTheme.labelMedium,
+                      ),
+                    ),
+                    StatusDot(color: color),
+                  ],
+                ),
+                Text(
+                  data.value,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+              ],
+            ),
     );
   }
 }
