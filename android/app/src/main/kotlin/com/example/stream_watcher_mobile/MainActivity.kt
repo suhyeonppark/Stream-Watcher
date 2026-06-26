@@ -2,6 +2,7 @@ package com.example.stream_watcher_mobile
 
 import android.content.Context
 import android.os.Build
+import android.os.VibrationAttributes
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -41,6 +42,9 @@ class MainActivity : FlutterActivity() {
                         vibrator.cancel()
                         result.success(null)
                     }
+                    "hasVibrator" -> {
+                        result.success(vibrator.hasVibrator())
+                    }
                     "getDeviceName" -> {
                         result.success(resolveDeviceName())
                     }
@@ -64,11 +68,24 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun vibrate(repeat: Int) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createWaveform(pattern, repeat))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(pattern, repeat)
+        // 진동 모터가 없는 기기(상당수 샤오미/태블릿)는 조용히 무시
+        if (!vibrator.hasVibrator()) return
+        when {
+            // Android 13+: USAGE_ALARM 속성으로 무음/방해금지 억제 우회
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU -> {
+                val effect = VibrationEffect.createWaveform(pattern, repeat)
+                val attrs = VibrationAttributes.Builder()
+                    .setUsage(VibrationAttributes.USAGE_ALARM)
+                    .build()
+                vibrator.vibrate(effect, attrs)
+            }
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.O -> {
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, repeat))
+            }
+            else -> {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(pattern, repeat)
+            }
         }
     }
 
