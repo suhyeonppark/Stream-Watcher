@@ -73,12 +73,11 @@ class MonitorScreen extends StatefulWidget {
 }
 
 class _MonitorScreenState extends State<MonitorScreen>
-    with SingleTickerProviderStateMixin {
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   final _pinController = TextEditingController();
   late final AnimationController _alertFlashController;
   String? _serverUrl;
   String? _token;
-  String? _lastAlertKey;
   String _message = '';
   bool _initializing = true;
   bool _busy = false;
@@ -87,12 +86,35 @@ class _MonitorScreenState extends State<MonitorScreen>
   final Set<String> _locallyAcknowledgedAlertKeys = <String>{};
   StreamSubscription<Map<String, dynamic>>? _eventsSub;
 
+  /// 이미 울린 알림 키. 새 키가 들어올 때만 플래시/시스템 알림을 다시 띄운다.
+  final Set<String> _alertedKeys = <String>{};
+  bool _vibrating = false;
+
+  /// PC와 실제로 통신이 되고 있는지. false면 화면의 지표는 마지막으로 받은
+  /// 과거 값이므로 "정상"으로 읽히면 안 된다.
+  bool _online = false;
+  DateTime _lastContactAt = DateTime.now();
+  Timer? _watchdog;
+  bool _reconnectScheduled = false;
+  bool _recovering = false;
+
+  /// 앱이 화면에 떠 있는지. 떠 있으면 인앱 알림 카드가 이미 보이므로
+  /// 시스템 알림까지 띄우지 않는다.
+  bool _foreground = true;
+
+  /// 이벤트가 이만큼 끊기면 HTTP 폴링으로 생존을 확인한다.
+  static const _staleAfter = Duration(seconds: 20);
+
+  /// 폴링까지 실패한 상태가 이만큼 이어지면 재탐색 + 재접속.
+  static const _deadAfter = Duration(seconds: 45);
+
   StreamWatcherApi get _api =>
       StreamWatcherApi(baseUrl: _serverUrl ?? _defaultServerUrl, token: _token);
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _alertFlashController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1400),
@@ -102,11 +124,32 @@ class _MonitorScreenState extends State<MonitorScreen>
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _eventsSub?.cancel();
+    _watchdog?.cancel();
     _alertChannel.invokeMethod('stopAlertVibration').catchError((_) {});
+    _alertChannel.invokeMethod('stopMonitoringService').catchError((_) {});
     _alertFlashController.dispose();
     _pinController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final foreground = state == AppLifecycleState.resumed;
+    if (foreground == _foreground) return;
+    _foreground = foreground;
+    if (!foreground || _token == null) return;
+    // 백그라운드에 있는 동안 연결이 죽었을 수 있으니 돌아오면 바로 확인한다.
+    _alertChannel.invokeMethod('cancelAlertNotification').catchError((_) {});
+    _loadStatus().catchError((err) {
+      if (err is UnauthorizedException) {
+        _handleUnauthorized();
+      } else {
+        _setOnline(false);
+        _scheduleReconnect();
+      }
+    });
   }
 
   Future<void> _restoreSession() async {
@@ -128,6 +171,7 @@ class _MonitorScreenState extends State<MonitorScreen>
     try {
       await _loadStatus();
       _connectEvents();
+      _startMonitoring();
     } on UnauthorizedException {
       // PC에서 페어링이 해제됨 → PIN 화면으로
       await _clearSession();
@@ -139,7 +183,9 @@ class _MonitorScreenState extends State<MonitorScreen>
       }
     } catch (_) {
       // 일시적 연결 실패(PC 꺼짐/네트워크) → 세션 유지하고 대시보드에서 재연결 시도
+      _online = false;
       _connectEvents();
+      _startMonitoring();
     } finally {
       if (mounted) setState(() => _initializing = false);
     }
@@ -169,6 +215,7 @@ class _MonitorScreenState extends State<MonitorScreen>
         await _loadStatus();
         await _saveSession();
         _connectEvents();
+        _startMonitoring();
       } catch (_) {
         _token = null;
         rethrow;
@@ -218,54 +265,141 @@ class _MonitorScreenState extends State<MonitorScreen>
 
   Future<void> _loadStatus() async {
     final status = await _api.status();
+    _applyStatus(status);
+  }
+
+  /// 새 status를 상태에 반영하고 알림 트리거까지 한 번에 처리한다.
+  /// (예전엔 build() 안에서 _syncAlertFlash를 불러, 회전/테마 변경 같은
+  ///  무관한 리빌드에서도 알림 로직이 돌았다.)
+  void _applyStatus(Map<String, dynamic> status) {
     _syncLocalAckKeys(status);
-    if (mounted) setState(() => _status = status);
+    _lastContactAt = DateTime.now();
+    if (!mounted) return;
+    setState(() {
+      _status = status;
+      _online = true;
+    });
+    _syncAlertFlash(_activeAlerts(status));
+  }
+
+  void _setOnline(bool value) {
+    if (_online == value) return;
+    if (mounted) setState(() => _online = value);
   }
 
   void _connectEvents() {
     _eventsSub?.cancel();
+    _reconnectScheduled = false;
     _eventsSub = _api.events().listen(
       (event) {
         final type = event['event'];
         final data = event['data'];
+        _lastContactAt = DateTime.now();
+        _setOnline(true);
         if (type == 'status' && data is Map<String, dynamic>) {
-          _syncLocalAckKeys(data);
-          setState(() => _status = data);
+          _applyStatus(data);
         } else if (type == 'scenario') {
           _loadStatus().catchError((_) {});
         } else if (type == 'devicesCleared' || type == 'unpaired') {
           _handleUnauthorized();
         }
       },
-      onError: (_) => _scheduleReconnect(),
-      onDone: () => _scheduleReconnect(),
+      onError: (err) {
+        if (err is UnauthorizedException) {
+          _handleUnauthorized();
+        } else {
+          _scheduleReconnect();
+        }
+      },
+      onDone: _scheduleReconnect,
     );
   }
 
+  /// onError와 onDone이 연달아 오는 게 정상이라, 가드가 없으면 재접속이 두 배로
+  /// 겹치면서 연결이 계속 불어난다.
   void _scheduleReconnect() {
-    if (_token == null) return;
+    if (_token == null || _reconnectScheduled) return;
+    _reconnectScheduled = true;
+    _setOnline(false);
     _loadStatus().catchError((err) {
       if (err is UnauthorizedException) _handleUnauthorized();
     });
     Future.delayed(const Duration(seconds: 3), () {
-      if (!mounted || _token == null) return;
+      if (!mounted || _token == null || !_reconnectScheduled) return;
       _connectEvents();
     });
+  }
+
+  /// 10초마다 "정말 살아 있나"를 확인한다. SSE가 조용히 멎어도 여기서
+  /// HTTP 폴링으로 상태를 끌어오고, 그마저 실패하면 오프라인으로 표시한 뒤
+  /// PC를 다시 찾아 재접속한다.
+  void _startWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = Timer.periodic(const Duration(seconds: 10), (_) async {
+      if (!mounted || _token == null) return;
+      final silent = DateTime.now().difference(_lastContactAt);
+      if (silent < _staleAfter) return;
+      try {
+        await _loadStatus();
+      } on UnauthorizedException {
+        _handleUnauthorized();
+      } catch (_) {
+        _setOnline(false);
+        if (silent > _deadAfter) await _recoverConnection();
+      }
+    });
+  }
+
+  /// PC의 IP가 바뀌면(DHCP 재할당) 저장된 주소는 영영 죽은 주소가 된다.
+  /// 재접속 전에 다시 탐색해서 주소를 갱신한다.
+  Future<void> _recoverConnection() async {
+    if (_recovering || _token == null) return;
+    _recovering = true;
+    try {
+      final server = await MobileDiscoveryClient().discover();
+      if (server != null && server.url != _serverUrl) {
+        _serverUrl = server.url;
+        await _saveSession();
+      }
+      _reconnectScheduled = false;
+      _connectEvents();
+      await _loadStatus();
+    } on UnauthorizedException {
+      _handleUnauthorized();
+    } catch (_) {
+      // 다음 주기에 다시 시도한다.
+    } finally {
+      _recovering = false;
+    }
   }
 
   void _handleUnauthorized() {
     _eventsSub?.cancel();
     _eventsSub = null;
-    _alertChannel.invokeMethod('stopAlertVibration').catchError((_) {});
+    _watchdog?.cancel();
+    _watchdog = null;
+    _reconnectScheduled = false;
+    _setVibrating(false);
+    _alertedKeys.clear();
+    _alertChannel.invokeMethod('cancelAlertNotification').catchError((_) {});
+    _alertChannel.invokeMethod('stopMonitoringService').catchError((_) {});
     _token = null;
     _serverUrl = null;
     _status = null;
+    _online = false;
     _clearSession();
     if (mounted) {
       setState(() {
         _message = 'PC에서 연결이 해제되었습니다. PIN으로 다시 연결하세요.';
       });
     }
+  }
+
+  /// 페어링이 살아 있는 동안만 포그라운드 서비스를 띄워, 화면이 꺼지거나
+  /// 앱이 백그라운드로 가도 SSE 연결이 유지되게 한다.
+  void _startMonitoring() {
+    _alertChannel.invokeMethod('startMonitoringService').catchError((_) {});
+    _startWatchdog();
   }
 
   Future<void> _setStage(int index) async {
@@ -278,7 +412,7 @@ class _MonitorScreenState extends State<MonitorScreen>
 
   Future<void> _ackAlert(String? alertId) async {
     // 탭 즉시 진동 중지 (다른 알림이 남아있으면 상태 갱신 후 다시 울림)
-    _alertChannel.invokeMethod('stopAlertVibration').catchError((_) {});
+    _setVibrating(false);
     final alerts = _activeAlerts(_status);
     final acknowledged = alertId == null
         ? alerts
@@ -289,6 +423,7 @@ class _MonitorScreenState extends State<MonitorScreen>
           _locallyAcknowledgedAlertKeys.add(_alertKey(alert));
         }
       });
+      _syncAlertFlash(_activeAlerts(_status));
     }
     await _run(() async {
       await _api.ack(alertId);
@@ -347,25 +482,67 @@ class _MonitorScreenState extends State<MonitorScreen>
   }
 
   void _syncAlertFlash(List<Map<String, dynamic>> alerts) {
-    if (alerts.isEmpty) {
-      _lastAlertKey = null;
+    // 트리거 키는 _alertKey를 그대로 쓴다. 예전처럼 alert['id']만 이어붙이면
+    // 서버가 id 없이 보낸 알림들이 전부 "null" 키가 되어, 내용이 다른 새 알림이
+    // 와도 같은 키로 판정돼 진동이 울리지 않았다.
+    final keys = alerts.map(_alertKey).toSet();
+
+    if (keys.isEmpty) {
+      _alertedKeys.clear();
       _alertFlashController.reset();
-      // 알림이 모두 해제되면 진동 중지
-      _alertChannel.invokeMethod('stopAlertVibration').catchError((_) {});
+      _setVibrating(false);
+      _alertChannel.invokeMethod('cancelAlertNotification').catchError((_) {});
       return;
     }
 
-    // 활성 알림 구성이 바뀌면(새 알림 추가 등) 진동/플래시 재트리거
-    final key = alerts.map((a) => '${a['id']}').join(',');
-    if (_lastAlertKey == key) return;
-    _lastAlertKey = key;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!mounted) return;
-      HapticFeedback.vibrate();
-      // 탭(확인)할 때까지 진동을 계속 반복
-      _alertChannel.invokeMethod('startAlertVibration').catchError((_) {});
-      _alertFlashController.forward(from: 0);
-    });
+    final fresh = keys.difference(_alertedKeys);
+    _alertedKeys
+      ..clear()
+      ..addAll(keys);
+
+    // 플래시/시스템 알림은 "새" 알림에만. 하나를 확인해서 목록이 줄어든 것뿐이면
+    // 다시 번쩍이지 않는다.
+    if (fresh.isNotEmpty) {
+      final head = alerts.firstWhere(
+        (a) => fresh.contains(_alertKey(a)),
+        orElse: () => alerts.first,
+      );
+      _postAlertNotification(head, alerts.length);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _alertFlashController.forward(from: 0);
+      });
+    }
+
+    // 미확인 알림이 하나라도 남아 있으면 진동은 계속 유지한다.
+    _setVibrating(true, restart: fresh.isNotEmpty);
+  }
+
+  /// 네이티브 반복 진동 on/off. 상태를 들고 있어서 build마다 채널을 두드리지 않는다.
+  void _setVibrating(bool on, {bool restart = false}) {
+    if (!on) {
+      if (!_vibrating) return;
+      _vibrating = false;
+      _alertChannel.invokeMethod('stopAlertVibration').catchError((_) {});
+      return;
+    }
+    if (_vibrating && !restart) return;
+    _vibrating = true;
+    // 네이티브 채널이 없는 플랫폼(iOS)에서만 Flutter 기본 햅틱으로 대체한다.
+    // 예전엔 둘을 항상 같이 호출해서 Android에서 진동이 겹쳐 끊겼다.
+    _alertChannel
+        .invokeMethod('startAlertVibration')
+        .catchError((_) => HapticFeedback.vibrate());
+  }
+
+  void _postAlertNotification(Map<String, dynamic> alert, int total) {
+    if (_foreground) return;
+    _alertChannel.invokeMethod('showAlertNotification', {
+      'title': '${alert['title'] ?? '방송 경고'}',
+      'message': total > 1
+          ? '${alert['message'] ?? ''} (외 ${total - 1}건)'
+          : '${alert['message'] ?? ''}',
+      'critical': '${alert['level']}' == 'critical',
+    }).catchError((_) {});
   }
 
   Future<void> _run(Future<void> Function() task) async {
@@ -388,7 +565,6 @@ class _MonitorScreenState extends State<MonitorScreen>
     final activeAlerts = _activeAlerts(status);
     final allActiveAlerts = _allActiveAlerts(status);
     final isDarkMode = Theme.of(context).brightness == Brightness.dark;
-    _syncAlertFlash(activeAlerts);
 
     return Scaffold(
       body: SafeArea(
@@ -420,8 +596,16 @@ class _MonitorScreenState extends State<MonitorScreen>
                       isDarkMode: isDarkMode,
                       onThemeToggle: widget.onThemeToggle,
                     ),
+                    if (!_online) ...[
+                      const SizedBox(height: 10),
+                      const _OfflineBanner(),
+                    ],
                     const SizedBox(height: 10),
-                    _SummaryPanel(status: status, alerts: allActiveAlerts),
+                    _SummaryPanel(
+                      status: status,
+                      alerts: allActiveAlerts,
+                      online: _online,
+                    ),
                     const SizedBox(height: 10),
                     _StatusGrid(status: status),
                     const SizedBox(height: 10),
@@ -435,8 +619,12 @@ class _MonitorScreenState extends State<MonitorScreen>
                       alerts:
                           status['recentAlerts'] as List<dynamic>? ?? const [],
                     ),
-                  ] else
-                    const _LoadingView(),
+                  ] else if (_online)
+                    const _LoadingView()
+                  else ...[
+                    const SizedBox(height: 40),
+                    const _OfflineBanner(),
+                  ],
                 ],
               ),
             if (activeAlerts.isNotEmpty)
@@ -804,12 +992,19 @@ class _ModeOption extends StatelessWidget {
 }
 
 class _SummaryPanel extends StatefulWidget {
-  const _SummaryPanel({required this.status, this.alerts = const []});
+  const _SummaryPanel({
+    required this.status,
+    this.alerts = const [],
+    this.online = true,
+  });
 
   final Map<String, dynamic> status;
 
   /// 해결되지 않은 오류(활성 알림) 목록. 2개 이상이면 자동으로 순환 표시.
   final List<Map<String, dynamic>> alerts;
+
+  /// PC와 통신이 끊긴 상태면 status는 과거 값이므로 "정상"으로 표시하지 않는다.
+  final bool online;
 
   @override
   State<_SummaryPanel> createState() => _SummaryPanelState();
@@ -862,6 +1057,10 @@ class _SummaryPanelState extends State<_SummaryPanel> {
       level = '${a['level'] ?? 'warn'}';
       title = '${a['title'] ?? '경고'}';
       message = '${a['message'] ?? ''}';
+    } else if (!widget.online) {
+      level = 'inactive';
+      title = 'PC와 연결 끊김';
+      message = '아래 지표는 마지막으로 받은 값입니다';
     } else {
       final summary = widget.status['summary'] as Map<String, dynamic>? ?? {};
       level = summary['level'] as String? ?? 'ok';
@@ -932,6 +1131,40 @@ class _SummaryPanelState extends State<_SummaryPanel> {
                   ],
                 ],
               ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 연결이 끊겼을 때 대시보드 맨 위에 붙는 경고 띠.
+/// 이게 없으면 PC가 꺼져도 화면은 마지막 값으로 계속 "정상"을 보여준다.
+class _OfflineBanner extends StatelessWidget {
+  const _OfflineBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    final color = levelColor(context, 'critical');
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withValues(alpha: 0.45)),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.cloud_off_rounded, color: color, size: 20),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'PC와 연결이 끊겼습니다 — 지금은 감시가 되지 않습니다',
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                    color: color,
+                    fontWeight: FontWeight.w700,
+                  ),
             ),
           ),
         ],

@@ -66,29 +66,45 @@ class StreamWatcherApi {
     return postJson('/api/mobile/ack', {'alertId': alertId});
   }
 
+  /// 서버에서 이 시간 동안 한 바이트도 오지 않으면 죽은 연결로 보고 끊는다.
+  /// Wi-Fi 로밍/AP 재부팅처럼 소켓은 열린 채 데이터만 멎는 상황은
+  /// 이 타임아웃이 없으면 onDone/onError가 영영 오지 않아 조용히 먹통이 된다.
+  static const eventIdleTimeout = Duration(seconds: 90);
+
   Stream<Map<String, dynamic>> events() async* {
     final client = HttpClient();
-    final req = await client.getUrl(_uri('/api/mobile/events'));
-    _authorize(req);
-    final res = await req.close();
-    var event = 'message';
-    final data = StringBuffer();
+    try {
+      final req = await client.getUrl(_uri('/api/mobile/events'));
+      _authorize(req);
+      final res = await req.close();
+      if (res.statusCode == 401) throw const UnauthorizedException();
 
-    await for (final line
-        in res.transform(utf8.decoder).transform(const LineSplitter())) {
-      if (line.isEmpty) {
-        if (data.isNotEmpty) {
-          yield {'event': event, 'data': jsonDecode(data.toString())};
+      var event = 'message';
+      final data = StringBuffer();
+
+      final lines = res
+          .transform(utf8.decoder)
+          .transform(const LineSplitter())
+          .timeout(eventIdleTimeout);
+
+      await for (final line in lines) {
+        if (line.isEmpty) {
+          if (data.isNotEmpty) {
+            yield {'event': event, 'data': jsonDecode(data.toString())};
+          }
+          event = 'message';
+          data.clear();
+        } else if (line.startsWith('event:')) {
+          event = line.substring(6).trim();
+        } else if (line.startsWith('data:')) {
+          data.write(line.substring(5).trim());
         }
-        event = 'message';
-        data.clear();
-      } else if (line.startsWith('event:')) {
-        event = line.substring(6).trim();
-      } else if (line.startsWith('data:')) {
-        data.write(line.substring(5).trim());
       }
+    } finally {
+      // 정상 종료/에러/구독 취소 어느 경로로 빠져나가든 소켓을 닫는다.
+      // 닫지 않으면 재접속할 때마다 PC 쪽에 유령 연결이 쌓인다.
+      client.close(force: true);
     }
-    client.close();
   }
 
   void _authorize(HttpClientRequest req) {

@@ -1,6 +1,9 @@
 package com.example.stream_watcher_mobile
 
+import android.Manifest
+import android.app.NotificationManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.VibrationAttributes
 import android.os.VibrationEffect
@@ -48,9 +51,53 @@ class MainActivity : FlutterActivity() {
                     "getDeviceName" -> {
                         result.success(resolveDeviceName())
                     }
+                    "startMonitoringService" -> {
+                        ensureNotificationPermission()
+                        MonitorService.start(this)
+                        result.success(null)
+                    }
+                    "stopMonitoringService" -> {
+                        MonitorService.stop(this)
+                        result.success(null)
+                    }
+                    "showAlertNotification" -> {
+                        showAlert(
+                            call.argument<String>("title") ?: "방송 경고",
+                            call.argument<String>("message") ?: "",
+                            call.argument<Boolean>("critical") ?: false,
+                        )
+                        result.success(null)
+                    }
+                    "cancelAlertNotification" -> {
+                        notificationManager.cancel(AlertNotifications.ID_ALERT)
+                        result.success(null)
+                    }
                     else -> result.notImplemented()
                 }
             }
+    }
+
+    private val notificationManager: NotificationManager by lazy {
+        getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    }
+
+    // Android 13+는 알림 권한을 사용자가 직접 허용해야 한다.
+    // 거부해도 인앱 진동/플래시는 그대로 동작하므로 결과를 따로 처리하지 않는다.
+    private fun ensureNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val granted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1001)
+        }
+    }
+
+    private fun showAlert(title: String, message: String, critical: Boolean) {
+        AlertNotifications.ensureChannels(this)
+        notificationManager.notify(
+            AlertNotifications.ID_ALERT,
+            AlertNotifications.alert(this, title, message, critical),
+        )
     }
 
     // 사용자가 설정한 기기 이름(예: "수현의 Galaxy") → 없으면 제조사+모델명
